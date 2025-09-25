@@ -108,6 +108,8 @@ void free_run_state(RunState* s) {
     free(s->value_cache);
 }
 
+//从checkpoint中读取权重，要求checkpoint是指定的格式，不知道是不是都是这种要求
+//根据每个weight的维度，计算指针的偏移量，每个指针指向对应偏移量，然后计算对应的长度，找下一个指针的位置
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
@@ -139,6 +141,7 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
+//读checkpoint
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
@@ -158,13 +161,17 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
+    
+    //前面都在打开checkpoint文件，这里开始解析文件
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
+    //读config和weight
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
+    //通过config，推出每个阶段的计算结果的大小，把结果需要的内存先预留出来
     malloc_run_state(&t->state, &t->config);
 }
 
@@ -242,6 +249,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
+    // 找当前token在token_embedding_table中的位置
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
 
@@ -389,6 +397,7 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     t->vocab = (char**)malloc(vocab_size * sizeof(char*));
     t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
     t->sorted_vocab = NULL; // initialized lazily
+    //存每一个int对应的char
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
         t->byte_pieces[i * 2 + 1] = '\0';
@@ -399,9 +408,12 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
     int len;
     for (int i = 0; i < vocab_size; i++) {
+        //token的score
         if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
+        //token的长度
         if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
         t->vocab[i] = (char *)malloc(len + 1);
+        //token本身，一个vocab[i]是一个token
         if (fread(t->vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
         t->vocab[i][len] = '\0'; // add the string terminating token
     }
@@ -456,11 +468,13 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
+        // 一个t->vocal[i]是一个token
         t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
         }
+        // qsort是标准库函数，按照vocab字典序排序
         qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
     }
 
@@ -473,6 +487,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     *n_tokens = 0;
 
     // add optional BOS (=1) token, if desired
+    // tokens[0] = 1,作为bos token
     if (bos) tokens[(*n_tokens)++] = 1;
 
     // add_dummy_prefix is true by default
@@ -480,19 +495,23 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // TODO: pretty sure this isn't correct in the general case but I don't have the
     // energy to read more of the sentencepiece code to figure out what it's doing
     if (text[0] != '\0') {
+        // 找到空格字符串在t->vocab中的下标id，作为dummy_prefix
         int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
         tokens[(*n_tokens)++] = dummy_prefix;
     }
 
+    // 字符采用的UTF-8编码，是兼容ASCII码的，这里处理UTF-8编码
     // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
     // Code point ↔ UTF-8 conversion
     // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
+    // 最小值    最大值       举例
     // U+0000	U+007F	    0xxxxxxx
     // U+0080	U+07FF	    110xxxxx	10xxxxxx
     // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
     // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
 
     // process the raw (UTF-8) byte sequence of the input string
+    // text是输入的prompt，循环解析prompt中的每一个字符
     for (char *c = text; *c != '\0'; c++) {
 
         // reset buffer if the current byte is ASCII or a leading byte
@@ -500,23 +519,28 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         // 0x80 is 10000000
         // in UTF-8, all continuation bytes start with "10" in first two bits
         // so in English this is: "if this byte is not a continuation byte"
+        // 判断是不是ASCII字符或开始符，如果是以10开头的话，那么这个字符是UTF-8中非首字母
         if ((*c & 0xC0) != 0x80) {
             // this byte must be either a leading byte (11...) or an ASCII char (0x...)
             // => reset our location, as we're starting a new UTF-8 codepoint
+            // 重新记录长度
             str_len = 0;
         }
 
         // append the current byte to the buffer
+        // 当前字节加入到已有的buffer中
         str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
         str_buffer[str_len] = '\0';
 
         // while the next character is a continuation byte, continue appending
         // but if there are too many of them, just stop to avoid overruning str_buffer size.
+        // 如果下一个依旧是非首字节且字节数没有超过4个，UTF-8编码中最多4个字节
         if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
             continue;
         }
 
         // ok c+1 is not a continuation byte, so we've read in a full codepoint
+        // 一个字符断掉了，字典里找到这个字符
         int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
 
         if (id != -1) {
@@ -526,6 +550,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             // byte_fallback encoding: just encode each byte as a token
             // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
             // so the individual bytes only start at index 3
+            // 把每个字节作为一个token处理，+3是给<unk>,<s>,</s>预留的
             for (int i=0; i < str_len; i++) {
                 tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
             }
@@ -534,11 +559,15 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     }
 
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
+    // 贪心地尝试拼接字符，每次拼接得分最高的字符，直到找不到可以拼接的字符对
+    // 这里根据chatgpt所说，transformers里会有一个merge文件，会有英文单词的合成路径（这个merge文件是提前训练好的）
+    // 比如any这个词，会先合成an，再合成any，在merge文件里是有合成的优先级的。当然，chatgpt可能并不可信，我这里觉得merge文件可能就在tokenizer里面包含了
     while (1) {
         float best_score = -1e10;
         int best_id = -1;
         int best_idx = -1;
 
+        // 逐个尝试每个字符和下一个字符拼接，查看是否可以拼接成新的token，且找出score最大的新token
         for (int i=0; i < (*n_tokens-1); i++) {
             // check if we can merge the pair (tokens[i], tokens[i+1])
             sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
@@ -551,20 +580,25 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             }
         }
 
+        // 找不到可以拼接的字符对，结束循环
         if (best_idx == -1) {
             break; // we couldn't find any more pairs to merge, so we're done
         }
 
         // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+        // 拼接token
         tokens[best_idx] = best_id;
         // delete token at position best_idx+1, shift the entire sequence back 1
+        // 后面所有的token前移，删掉best_idx+1位置的token
         for (int i = best_idx+1; i < (*n_tokens-1); i++) {
             tokens[i] = tokens[i+1];
         }
+        // token总数减1
         (*n_tokens)--; // token length decreased
     }
 
     // add optional EOS (=2) token, if desired
+    // 2做为结束符
     if (eos) tokens[(*n_tokens)++] = 2;
 
     free(str_buffer);
@@ -731,6 +765,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     if (prompt == NULL) { prompt = empty_prompt; }
 
     // encode the (string) prompt into tokens sequence
+    // encode阶段，把prompt编码成token序列
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
@@ -744,6 +779,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
+    // 这里是把每个token都执行了一遍forward,我理解prompt要执行是要计算kv cache,但是多了一些额外的计算
+    // 这里没把prompt整合在一起
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
@@ -952,9 +989,11 @@ int main(int argc, char *argv[]) {
 
     // build the Sampler
     Sampler sampler;
+    //就很简单的赋值
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
     // run!
+    // 运行，有generate和chat两种模式
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
@@ -965,6 +1004,7 @@ int main(int argc, char *argv[]) {
     }
 
     // memory and file handles cleanup
+    // 释放空间
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
