@@ -461,6 +461,7 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
+// 这个encode，是把一个句子转成token id
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
@@ -727,6 +728,7 @@ int sample(Sampler* sampler, float* logits) {
     int next;
     if (sampler->temperature == 0.0f) {
         // greedy argmax sampling: take the token with the highest probability
+        // 温度为0的情况，不同token的概率差距被无限放大，所以找到最大可能性的token作为下一个token
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
@@ -738,9 +740,11 @@ int sample(Sampler* sampler, float* logits) {
         // we sample from this distribution to get the next token
         if (sampler->topp <= 0 || sampler->topp >= 1) {
             // simply sample from the predicted probability distribution
+            // 相加大于coin的地方，相比于top-p，不会优先选择概率最大的token，而是直接按顺序走
             next = sample_mult(logits, sampler->vocab_size, coin);
         } else {
             // top-p (nucleus) sampling, clamping the least likely tokens to zero
+            // 先按概率对token排序，然后从概率相加大于top-p的token中，随机选择一个token作为返回
             next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
         }
     }
@@ -787,16 +791,17 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         float* logits = forward(transformer, token, pos);
 
         // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
+        if (pos < num_prompt_tokens - 1) { //还在prompt里
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
-        } else {
+        } else { //prompt结束，开始生成新的token
             // otherwise sample the next token from the logits
             next = sample(sampler, logits);
         }
         pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
+        // 假设BOS=1的情况下，next为1，直接终止
         if (next == 1) { break; }
 
         // print the token as string, decode it with the Tokenizer object
@@ -835,7 +840,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // I manually inspected the tokens for a few chat conversations compared to
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
-
+// 我理解chat和generate的主要区别是，chat每一轮用户都会有新的输入，每一轮都需要进行encode，同时要区分是不是第一次，第一次的话会有system prompt，然后以特定方式组成字符串，让tokenizer能够识别
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
 
